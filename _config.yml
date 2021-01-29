@@ -1,1 +1,9 @@
+title: F1Tenth
+email: nagarakshithms@gmail.com
+description: >- # this means to ignore newlines until "baseurl:"
+  Assignments of the course
+baseurl: "" # the subpath of your site, e.g. /blog
+url: "https://nagarakshith1.github.io/F1-10/" # the base hostname & protocol for your site, e.g. http://example.com
+github_username: Nagarakshith1
+linkedin_username: nagarakshith 
 theme: jekyll-theme-slate

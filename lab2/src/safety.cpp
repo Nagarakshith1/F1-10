@@ -5,125 +5,91 @@
 #include"ros/ros.h"
 #include "sensor_msgs/LaserScan.h"
 #include "nav_msgs/Odometry.h"
+#include "ackermann_msgs/AckermannDriveStamped.h"
+#include "std_msgs/Bool.h"
+#include "lab2/get_distances_to_ego_edges.h"
 
-class GetDistancesToEgoEdges{
-    float width_;
-    float height_;
-    float aspect_ratio_angle_;
-    float ray_count_;
-    std::unordered_map<int,std::vector<float>> line_cords_;
-
-    float inter_x_;
-    float inter_y_;
-    float x2_;
-    float y2_;
-    float x3_;
-    float y3_;
-    float x4_;
-    float y4_;
-
-    void getInter(float x1,float y1,float x2,float y2,float x3,float y3,float x4,float y4)
-    {
-        inter_x_ = ((x1*y2 - y1*x2) * (x3-x4) - (x1-x2) * (x3*y4-y3*x4))/((x1-x2)*(y3-y4) - (y1-y2)*(x3-x4));
-        inter_y_ = ((x1*y2 - y1*x2) * (y3-y4) - (y1-y2) * (x3*y4-y3*x4))/((x1-x2)*(y3-y4) - (y1-y2)*(x3-x4));
-    }
-    int getLineId(float th)
-    {
-        if(th< (- M_PI_2 + aspect_ratio_angle_)|| th > (3*M_PI_2 - aspect_ratio_angle_))
-            {
-                return 1;
-            }
-            else if(th > (M_PI_2+ aspect_ratio_angle_) && th < (3*M_PI_2 - aspect_ratio_angle_))
-            {
-                return 2;
-            }
-            else if(th > (M_PI_2 - aspect_ratio_angle_) && th < (M_PI_2 + aspect_ratio_angle_))
-            {
-                return 3;
-            }
-            else if(th > (-M_PI_2+aspect_ratio_angle_) && th<(M_PI_2 - aspect_ratio_angle_))
-            {
-                return 4;
-            }
-            return 0;
-    }
-    
+class Safety
+{
+    ros::Subscriber odom_sub_;
+    ros::Subscriber scan_sub_;
+    ros::Publisher brake_pub_;
+    ros::Publisher brake_bool_pub_;
+    ros::NodeHandle n_;
+    GetDistancesToEgoEdges dist_;
+    float current_vel_x_ = 0;
+    std_msgs::Bool brake_bool_;
+    ackermann_msgs::AckermannDriveStamped ackermann_msg_;
+    float ttc_thresh_ = 0.32;
+    float brake_rate_ = 10;
+    float brake_duration_ = 1;
     public:
-    float x1_ = 0.0;
-    float y1_ = 0.0;
-    float lidar_to_ego_center_ = 0.0;
-    
-    float start_th_ = 3 * M_PI_2;
-    float step_size_ = 0.00582315586;
-    
-    std::vector<float> x_cords_ego_;
-    std::vector<float> y_cords_ego_;
-    std::vector<float> dist_to_ego_edge_;
+    Safety()
+    {
+        scan_sub_ = n_.subscribe("scan",1,&Safety::processLidarScan,this);
+        odom_sub_ = n_.subscribe("odom",1,&Safety::velocityUpdate,this);
+        brake_pub_ = n_.advertise<ackermann_msgs::AckermannDriveStamped>("brake",1);
+        brake_bool_pub_ = n_.advertise<std_msgs::Bool>("brake_bool",1);
 
-    GetDistancesToEgoEdges(float w, float h,float ray_count):width_{w},height_{h},ray_count_{ray_count}
-    {
-        aspect_ratio_angle_ = std::atan(width_/height_);
-        line_cords_[1] = {0,-height_/2,1,-height_/2};
-        line_cords_[2] = {-width_/2,0,-width_/2,1};
-        line_cords_[3] = {0,height_/2,1,height_/2};
-        line_cords_[4] = {width_/2,0,width_/2,1};
+        float width = 0.2032;
+        float height = 0.3302;
+        float lidar_to_base_link = 0.275;
+        float ray_count = 1080;
+
+        n_.getParam("width",width);
+        n_.getParam("wheelbase",height);
+        n_.getParam("scan_distance_to_base_link",lidar_to_base_link);
+        n_.getParam("scan_beams",ray_count);
+
+        GetDistancesToEgoEdges dist(width,height,ray_count);
+        dist.lidar_to_ego_center_ = lidar_to_base_link - height/2;
+        dist.getEgoEdgeLidarDist();
+        
+        brake_bool_.data = true;
+        ackermann_msg_.drive.speed = 0;
+        dist_ = dist;
     }
-    void getEgoEdgeCords()
+    void processLidarScan(const sensor_msgs::LaserScanConstPtr &scan_msg)
     {
-        float th = start_th_ + step_size_;
-        for(int i=0; i<ray_count_; i++)
+        float min_time = scan_msg->range_max+1;
+        for(int i=0; i<scan_msg->ranges.size();i++)
         {
-            th -= step_size_;
-            x2_ = 1 * std::cos(th);
-            y2_ = 1 * std::sin(th);
-            int id = getLineId(th);
-            x3_ = line_cords_[id][0];
-            y3_ = line_cords_[id][1];
-            x4_ = line_cords_[id][2];
-            y4_ = line_cords_[id][3];
+            float num = scan_msg->ranges[i] - dist_.dist_to_ego_edge_[i];
+            float den = current_vel_x_ * std::cos(dist_.ray_angles_[i] - M_PI_2);
+            if(den <= 0.0)
+            {
+                continue;
+            }
+            min_time = std::min(min_time,num/den);
 
-            getInter(x1_,y1_,x2_,y2_,x3_,y3_,x4_,y4_);
-            x_cords_ego_.push_back(inter_x_);
-            y_cords_ego_.push_back(inter_y_);
+            if(min_time<ttc_thresh_){
+                ROS_INFO_STREAM("Applying Brake \n");
+                brakePublish();
+                ROS_INFO_STREAM("Applying Brake Stopped \n");
+                return;
+            }
         }
     }
-    void getEgoEdgeLidarDist()
+    void velocityUpdate(const nav_msgs::OdometryConstPtr &odom_msg)
     {
-        getEgoEdgeCords();
-        for(int i=0;i<x_cords_ego_.size();i++)
-        {   
-            float x = x_cords_ego_[i];
-            float y = y_cords_ego_[i] - lidar_to_ego_center_;
-            dist_to_ego_edge_.push_back(std::sqrt(x*x + y*y));
-        }
-
+        current_vel_x_ = odom_msg->twist.twist.linear.x;
     }
-    
-
+    void brakePublish(){
+        ros::Rate pub_rate(brake_rate_);
+        int count = 0;
+        while(count < brake_duration_*brake_rate_)
+        {
+            count++;
+            brake_pub_.publish(ackermann_msg_);
+            brake_bool_pub_.publish(brake_bool_);
+            pub_rate.sleep();
+        }
+    }
 };
-
 
 int main(int argc, char** argv)
 {   
     ros::init(argc,argv,"safety");
-    ros::NodeHandle n;
-
-    float width = 0.2032;
-    float height = 0.3302;
-    float lidar_to_base_link = 0.275;
-    float ray_count = 1080;
-
-    n.getParam("width",width);
-    n.getParam("wheelbase",height);
-    n.getParam("scan_distance_to_base_link",lidar_to_base_link);
-    n.getParam("scan_beams",ray_count);
-
-    GetDistancesToEgoEdges dist(width,height,ray_count);
-    dist.lidar_to_ego_center_ = lidar_to_base_link - height/2;
-    dist.getEgoEdgeLidarDist();
-
-    scan_sub = n.subscribe("scan",1,&LidarRange::scan_cb,this);
-    vel_sub = n.subscribe("")
-
-    
+    Safety safe;
+    ros::spin();
 }
